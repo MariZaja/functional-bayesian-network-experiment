@@ -19,6 +19,7 @@ Uczenie: model.fit(train_df, estimator="SVI") — pgmpy uruchamia Pyro SVI
 Predykcja: ręczna inferencja bayesowska przez scipy_norm.logpdf
 """
 
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -51,14 +52,14 @@ Q_DEC = {i: s for s, i in Q_ENC.items()}
 
 EMOTION_MAP = {"Anger": "Angry", "Sadness": "Sad", "Happiness": "Happy", "Calm": "Calm"}
 
-V_AUDIO = [f"V{k}" for k in range(1,  21)]   # V1–V20
-V_VIDEO = [f"V{k}" for k in range(21, 41)]   # V21–V40
-V_EEG   = [f"V{k}" for k in range(41, 61)]   # V41–V60
+V_AUDIO = [f"V{k}" for k in range(1,  4)]   # V1–V20
+V_VIDEO = [f"V{k}" for k in range(4, 7)]   # V21–V40
+V_EEG   = [f"V{k}" for k in range(7, 10)]   # V41–V60
 
 MODALITIES = {
-    "audio": {"q": "Q_audio", "v_cols": V_AUDIO},
-    "video": {"q": "Q_video", "v_cols": V_VIDEO},
-    "eeg":   {"q": "Q_eeg",   "v_cols": V_EEG},
+    "audio": {"q": "Q_audio", "v_cols": V_AUDIO, "trial_offset": 0},
+    "video": {"q": "Q_video", "v_cols": V_VIDEO, "trial_offset": 0},
+    "eeg":   {"q": "Q_eeg",   "v_cols": V_EEG,   "trial_offset": 1},  # EEG trial_id is 0-indexed
 }
 
 N_E = len(E_STATES)   # 4
@@ -67,34 +68,59 @@ N_Q = len(Q_STATES)   # 3
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
-def load_data(data_dir: str = "dane") -> pd.DataFrame:
-    dq = pd.read_csv("prep/e01_data_quality_prep.csv")
-    dq[["trial_id", "window_id"]] = (
-        dq["window_id"].str.split("_", expand=True).astype(int)
-    )
-    dq["window_id"] += 1
-    dq["E"] = dq["window_emotion"].map(EMOTION_MAP)
+def load_data(
+    lda_dir: str = "dane/eav_lda",
+    q_dir: str = "dane/eav_q/files",
+) -> pd.DataFrame:
+    clusters = [['e05', 'e08', 'e11', 'e16', 'e17', 'e32', 'e36'], ['e01', 'e02', 'e03', 'e04', 'e06', 'e07', 'e09', 'e10', 'e12', 'e13', 'e14', 'e15', 'e18', 'e19', 'e20', 'e21', 'e22', 'e23', 'e24', 'e25', 'e26', 'e27', 'e28', 'e29', 'e30', 'e31', 'e33', 'e34', 'e35', 'e37', 'e38', 'e39', 'e40', 'e41', 'e42']]
 
-    base = dq[["trial_id", "window_id", "E",
-               "audio_flag", "video_flag", "eeg_flag"]].copy()
-    base = base.rename(columns={
-        "audio_flag": "Q_audio",
-        "video_flag": "Q_video",
-        "eeg_flag":   "Q_eeg",
-    })
+    chunks = []
+    
+    for cluster in clusters:
+        chunk = []
+        for eid in cluster:
+            q_path = os.path.join(q_dir, f"{eid}_data_quality.parquet")
+            if not os.path.exists(q_path):
+                continue
 
-    for mod, cfg in MODALITIES.items():
-        feat = pd.read_csv(f"{data_dir}/{mod}.csv")
-        pc_rename = {f"PC{i}": cfg["v_cols"][i - 1] for i in range(1, 21)}
-        feat = feat.rename(columns=pc_rename)
-        base = base.merge(
-            feat[["trial_id", "window_id"] + cfg["v_cols"]],
-            on=["trial_id", "window_id"],
-            how="left",
-        )
+            dq = pd.read_parquet(q_path)
+            split = dq["window_id"].str.split("_", expand=True).astype(int)
+            dq["trial_id"]  = split[0]
+            dq["window_id"] = split[1] + 1
+            dq["E"] = dq["window_emotion"].map(EMOTION_MAP)
+            dq = dq.rename(columns={
+                "audio_flag": "Q_audio",
+                "video_flag": "Q_video",
+                "eeg_flag":   "Q_eeg",
+            })
+            base = dq[["trial_id", "window_id", "E", "Q_audio", "Q_video", "Q_eeg"]].copy()
+            base["entity_id"] = eid
 
-    base = base.dropna(subset=["E"]).reset_index(drop=True)
-    return base
+            for mod, cfg in MODALITIES_ACTIVE.items():
+                lda_path = os.path.join(lda_dir, eid, f"{eid}_{mod}_lda.parquet")
+                if not os.path.exists(lda_path):
+                    continue
+                feat = pd.read_parquet(lda_path)
+                if cfg["trial_offset"]:
+                    feat = feat.copy()
+                    feat["trial_id"] = feat["trial_id"] + cfg["trial_offset"]
+                lda_cols = [c for c in feat.columns if c.startswith("lda_")]
+                n = min(len(cfg["v_cols"]), len(lda_cols))
+                lda_rename = {f"lda_{i}": cfg["v_cols"][i - 1] for i in range(1, n + 1)}
+                feat = feat.rename(columns=lda_rename)
+                v_avail = cfg["v_cols"][:n]
+                base = base.merge(
+                    feat[["trial_id", "window_id"] + v_avail],
+                    on=["trial_id", "window_id"],
+                    how="inner",
+                )
+
+            chunk.append(base)
+        df = pd.concat(chunk, ignore_index=True)
+        df = df.dropna(subset=["E"]).reset_index(drop=True)
+        chunks.append(df)
+
+    return chunks
 
 
 # ── Przygotowanie DataFrame do fit() ──────────────────────────────────────────
@@ -104,7 +130,7 @@ def prepare_fit_df(df: pd.DataFrame, use_quality: bool) -> pd.DataFrame:
     out = df.copy()
     out["E"] = out["E"].map(E_ENC)
     if use_quality:
-        for cfg in MODALITIES.values():
+        for cfg in MODALITIES_ACTIVE.values():
             q_col = cfg["q"]
             out[q_col] = out[q_col].map(
                 lambda x: Q_ENC[x] if (pd.notna(x) and x in Q_ENC) else np.nan
@@ -264,7 +290,7 @@ def build_model(use_quality: bool) -> FunctionalBayesianNetwork:
     use_quality=False → E──►V       (tylko krawędzie E→V, brak węzłów Q)
     """
     edges = []
-    for cfg in MODALITIES.values():
+    for cfg in MODALITIES_ACTIVE.values():
         q_col = cfg["q"]
         for v_name in cfg["v_cols"]:
             edges.append(("E", v_name))          # E ──► V  (oba modele)
@@ -276,7 +302,7 @@ def build_model(use_quality: bool) -> FunctionalBayesianNetwork:
     # Węzeł E — zawsze
     model.add_cpds(FunctionalCPD("E", fn=cpd_fn_E))
 
-    for cfg in MODALITIES.values():
+    for cfg in MODALITIES_ACTIVE.values():
         q_col = cfg["q"]
 
         if use_quality:
@@ -327,8 +353,8 @@ def train(
     fit_df = prepare_fit_df(train_df, use_quality)
 
     # Kolumny wymagane przez dany wariant modelu
-    q_cols    = [cfg["q"] for cfg in MODALITIES.values()]
-    all_v_cols = V_AUDIO + V_VIDEO + V_EEG
+    q_cols    = [cfg["q"] for cfg in MODALITIES_ACTIVE.values()]
+    all_v_cols = [col for cfg in MODALITIES_ACTIVE.values() for col in cfg["v_cols"]]
     drop_cols  = (q_cols + all_v_cols) if use_quality else all_v_cols
     fit_df = fit_df.dropna(subset=drop_cols).reset_index(drop=True)
 
@@ -358,7 +384,7 @@ def predict_E(
     for _, row in test_df.iterrows():
         log_liks = np.zeros(len(E_STATES))
 
-        for cfg in MODALITIES.values():
+        for cfg in MODALITIES_ACTIVE.values():
 
             if use_quality:
                 q_col = cfg["q"]
@@ -419,7 +445,7 @@ def compute_kl_matrix(
 ) -> pd.DataFrame:
     rows: dict[str, dict[str, float]] = {}
 
-    for mod, cfg in MODALITIES.items():
+    for mod, cfg in MODALITIES_ACTIVE.items():
         q_col   = cfg["q"]
         kl_by_q: dict[str, list[float]] = {q: [] for q in Q_STATES}
 
@@ -485,7 +511,7 @@ def compute_kl_matrix_per_emotion(
     use_quality: bool,
 ) -> dict[str, pd.DataFrame]:
     kl_store: dict[str, dict[str, dict[str, list[float]]]] = {
-        e_name: {mod: {q: [] for q in Q_STATES} for mod in MODALITIES}
+        e_name: {mod: {q: [] for q in Q_STATES} for mod in MODALITIES_ACTIVE}
         for e_name in E_STATES
     }
 
@@ -494,7 +520,7 @@ def compute_kl_matrix_per_emotion(
         if pd.isna(e_true) or e_true not in E_STATES:
             continue
 
-        for mod, cfg in MODALITIES.items():
+        for mod, cfg in MODALITIES_ACTIVE.items():
             q_col = cfg["q"]
             if pd.isna(row[q_col]):
                 continue
@@ -541,7 +567,7 @@ def compute_kl_matrix_per_emotion(
     result: dict[str, pd.DataFrame] = {}
     for e_name in E_STATES:
         rows: dict[str, dict[str, float]] = {}
-        for mod in MODALITIES:
+        for mod in MODALITIES_ACTIVE:
             s = kl_store[e_name][mod]
             rows[mod] = {
                 "Q_high": float(np.mean(s["GOOD"]))  if s["GOOD"]  else 0.0,
@@ -559,7 +585,7 @@ def print_sigma_q(params: dict[str, torch.Tensor]) -> None:
     """Średnie sigma_q po cechach, per modalność i poziom jakości.
     Sprawdza, czy model rzeczywiście dyskontuje niską jakość (BAD > NOISY > GOOD)."""
     print("\nŚrednie sigma_q (po cechach) — oczekiwane: BAD > NOISY > GOOD:")
-    for mod, cfg in MODALITIES.items():
+    for mod, cfg in MODALITIES_ACTIVE.items():
         sig_means = {
             Q_STATES[qi]: float(np.mean([
                 params[f"{v}_sigma_q"].detach().numpy()[qi]
@@ -569,7 +595,6 @@ def print_sigma_q(params: dict[str, torch.Tensor]) -> None:
         }
         print(f"  {mod:6s}: " +
               "  ".join(f"{q}={sig_means[q]:.3f}" for q in Q_STATES))
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -581,96 +606,103 @@ if __name__ == "__main__":
         help="Użyj modelu bez węzłów Q (tylko E→V). Domyślnie: z quality (E→V◄Q).",
     )
     parser.add_argument("--steps", type=int, default=3000)
+    parser.add_argument(
+        "--use-modalities", nargs="+",
+        choices=["audio", "video", "eeg", "all"],
+        default=["all"],
+        help="Które modalności użyć: audio video eeg all. Domyślnie all.",
+    )
     args = parser.parse_args()
     use_quality = not args.no_quality
+
+    if "all" in args.use_modalities:
+        active_modalities = ["audio", "video", "eeg"]
+    else:
+        active_modalities = args.use_modalities
+
+    MODALITIES_ACTIVE = {k: v for k, v in MODALITIES.items() if k in active_modalities}
 
     print(f"Tryb: {'z quality (E→V◄Q)' if use_quality else 'bez quality (E→V)'}\n")
 
     print("Wczytywanie danych…")
-    df_all = load_data()
-    print(f"  Łącznie okien: {len(df_all)}")
-    print(f"  Rozkład E: {df_all['E'].value_counts().to_dict()}")
-    for cfg in MODALITIES.values():
-        n = df_all[cfg["q"]].notna().sum()
-        print(f"  {cfg['q']}: {n} okien z etykietą jakości  "
-              f"| {df_all[cfg['q']].value_counts(dropna=True).to_dict()}")
+    data = load_data()
+    print(f"  Łącznie klastrów: {len(data)}")
 
-    # Stratyfikowany podział (E × klasa jakości)
-    def _qual_class(row):
-        for cfg in MODALITIES.values():
-            q = row[cfg["q"]]
-            if pd.notna(q) and q != "GOOD":
-                return "LOW"
-        return "GOOD"
+    for df_all in data:
+        def _qual_class(row):
+            for cfg in MODALITIES_ACTIVE.values():
+                q = row[cfg["q"]]
+                if pd.notna(q) and q != "GOOD":
+                    return "LOW"
+            return "GOOD"
 
-    df_all["_qual_class"] = df_all.apply(_qual_class, axis=1)
-    strat_key = df_all["E"] + "_" + df_all["_qual_class"]
+        df_all["_qual_class"] = df_all.apply(_qual_class, axis=1)
+        strat_key = df_all["E"] + "_" + df_all["_qual_class"]
 
-    train_df, test_df = train_test_split(
-        df_all, test_size=0.2, random_state=42, stratify=strat_key
-    )
-    train_df = train_df.drop(columns=["_qual_class"]).reset_index(drop=True)
-    test1_df = test_df[test_df["_qual_class"] == "GOOD"].drop(columns=["_qual_class"]).reset_index(drop=True)
-    test2_df = test_df[test_df["_qual_class"] == "LOW" ].drop(columns=["_qual_class"]).reset_index(drop=True)
-    test_df  = test_df.drop(columns=["_qual_class"]).reset_index(drop=True)
-
-    print(f"\n  Train: {len(train_df)} | Test: {len(test_df)} "
-          f"(all-GOOD: {len(test1_df)}, lower-quality: {len(test2_df)})\n")
-
-    # Buduj właściwy wariant modelu i ucz
-    model  = build_model(use_quality)
-    params = train(model, train_df, use_quality, num_steps=args.steps)
-
-    e_vals = params["E_probs"].tolist()
-    print(f"\n  E_probs: [{', '.join(f'{E_STATES[i]}={v:.3f}' for i, v in enumerate(e_vals))}]")
-    e_prior = params["E_probs"].detach().numpy()
-
-    # Diagnostyka sigma_q — tylko w modelu z quality
-    if use_quality:
-        print_sigma_q(params)
-
-    # KL matrix
-    print("\nMacierz KL  I(mod, Q):")
-    kl_mat = compute_kl_matrix(train_df, params, e_prior, use_quality)
-    print(kl_mat.round(3).to_string())
-
-    # KL matrix per emocja
-    print("Macierz KL per emocja  I = E[KL(P(E|X_m,Q) ‖ P(E)) | E_true=e]:")
-    kl_per_e = compute_kl_matrix_per_emotion(train_df, params, e_prior, use_quality)
-    for e_name, mat in kl_per_e.items():
-        print(f"E = {e_name}:")
-        print(mat.round(3).to_string())
-
-    # Ewaluacja
-    def evaluate(df: pd.DataFrame, label: str) -> None:
-        if len(df) == 0:
-            print(f"\n=== {label} — brak próbek ===")
-            return
-        print(f"\n=== {label} ({len(df)} próbek) ===")
-        res = predict_E(df, params, e_prior, use_quality)
-        acc = accuracy_score(res["E_true"], res["E_pred"])
-        print(f"Accuracy: {acc:.3f}  ({int(acc * len(res))}/{len(res)})")
-
-        # Accuracy per emocja = recall klasy: z okien o E_true=e ile trafiło na e
-        print("Accuracy per emocja:")
-        for e_name in E_STATES:
-            m = res["E_true"] == e_name
-            n = int(m.sum())
-            if n == 0:
-                print(f"  {e_name:6s}:   —    (brak próbek)")
-                continue
-            correct = int((res.loc[m, "E_pred"] == e_name).sum())
-            print(f"  {e_name:6s}: {correct / n:.3f}  ({correct}/{n})")
-        print()
-
-        print(classification_report(
-            res["E_true"],
-            res["E_pred"],
-            labels=E_STATES,
-            target_names=E_STATES,
-            zero_division=0,)
+        train_df, test_df = train_test_split(
+            df_all, test_size=0.2, random_state=42, stratify=strat_key
         )
+        train_df = train_df.drop(columns=["_qual_class"]).reset_index(drop=True)
+        test1_df = test_df[test_df["_qual_class"] == "GOOD"].drop(columns=["_qual_class"]).reset_index(drop=True)
+        test2_df = test_df[test_df["_qual_class"] == "LOW" ].drop(columns=["_qual_class"]).reset_index(drop=True)
+        test_df  = test_df.drop(columns=["_qual_class"]).reset_index(drop=True)
 
-    evaluate(test_df,  "Test — cały zbiór")
-    evaluate(test1_df, "Test1 — all-GOOD")
-    evaluate(test2_df, "Test2 — lower-quality")
+        print(f"\n  Train: {len(train_df)} | Test: {len(test_df)} "
+            f"(all-GOOD: {len(test1_df)}, lower-quality: {len(test2_df)})\n")
+
+        # Buduj właściwy wariant modelu i ucz
+        model  = build_model(use_quality)
+        params = train(model, train_df, use_quality, num_steps=args.steps)
+
+        e_vals = params["E_probs"].tolist()
+        print(f"\n  E_probs: [{', '.join(f'{E_STATES[i]}={v:.3f}' for i, v in enumerate(e_vals))}]")
+        e_prior = params["E_probs"].detach().numpy()
+
+        # Diagnostyka sigma_q — tylko w modelu z quality
+        if use_quality:
+            print_sigma_q(params)
+
+        # KL matrix
+        print("\nMacierz KL  I(mod, Q):")
+        kl_mat = compute_kl_matrix(train_df, params, e_prior, use_quality)
+        print(kl_mat.round(3).to_string())
+
+        # KL matrix per emocja
+        print("Macierz KL per emocja  I = E[KL(P(E|X_m,Q) ‖ P(E)) | E_true=e]:")
+        kl_per_e = compute_kl_matrix_per_emotion(train_df, params, e_prior, use_quality)
+        for e_name, mat in kl_per_e.items():
+            print(f"E = {e_name}:")
+            print(mat.round(3).to_string())
+
+        # Ewaluacja
+        def evaluate(df: pd.DataFrame, label: str) -> None:
+            if len(df) == 0:
+                print(f"\n=== {label} — brak próbek ===")
+                return
+            print(f"\n=== {label} ({len(df)} próbek) ===")
+            res = predict_E(df, params, e_prior, use_quality)
+            acc = accuracy_score(res["E_true"], res["E_pred"])
+            print(f"Accuracy: {acc:.3f}  ({int(acc * len(res))}/{len(res)})")
+
+            print("Accuracy per emocja:")
+            for e_name in E_STATES:
+                m = res["E_true"] == e_name
+                n = int(m.sum())
+                if n == 0:
+                    print(f"  {e_name:6s}:   —    (brak próbek)")
+                    continue
+                correct = int((res.loc[m, "E_pred"] == e_name).sum())
+                print(f"  {e_name:6s}: {correct / n:.3f}  ({correct}/{n})")
+            print()
+
+            print(classification_report(
+                res["E_true"],
+                res["E_pred"],
+                labels=E_STATES,
+                target_names=E_STATES,
+                zero_division=0,)
+            )
+
+        evaluate(test_df,  "Test — cały zbiór")
+        evaluate(test1_df, "Test1 — all-GOOD")
+        evaluate(test2_df, "Test2 — lower-quality")
